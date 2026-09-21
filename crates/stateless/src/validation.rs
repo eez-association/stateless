@@ -155,15 +155,13 @@ pub enum StatelessValidationError {
     #[error("signer recovery failed")]
     SignerRecovery,
 
-    /// Error when requested transaction checkpoints are not strictly ordered.
-    #[error(
-        "transaction checkpoint indices must be strictly increasing, got {previous} before {current}"
-    )]
-    UnorderedTransactionCheckpoints {
-        /// The preceding requested transaction index.
-        previous: usize,
-        /// The next requested transaction index.
-        current: usize,
+    /// Error when requested checkpoints are not strictly ordered.
+    #[error("checkpoints must be strictly increasing, got {previous} before {current}")]
+    UnorderedCheckpoints {
+        /// The preceding requested position.
+        previous: CheckpointAt,
+        /// The next requested position.
+        current: CheckpointAt,
     },
 
     /// Error when a requested checkpoint is outside the block's transactions.
@@ -220,19 +218,38 @@ pub struct StatelessValidationOutput<R = EthereumReceipt> {
     pub block_access_list: Option<BlockAccessList>,
 }
 
-/// Selected transaction state checkpoints from one validated block.
+/// Selected state checkpoints from one validated block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockStateCheckpoints {
-    /// Requested cumulative transaction checkpoints, in transaction order.
-    pub transaction_state_checkpoints: Vec<TransactionStateCheckpoint>,
+    /// Requested checkpoints, in execution order.
+    pub checkpoints: Vec<StateCheckpoint>,
 }
 
-/// A cumulative state root immediately after one transaction.
+/// Where a candidate is sealed. Variant order is execution order, so the
+/// derived `Ord` is the ordering a request must be in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckpointAt {
+    /// After the pre-execution system calls (EIP-2935/4788), before transaction 0.
+    PreExecution,
+    /// Immediately after the transaction at this zero-based position.
+    Transaction(usize),
+}
+
+impl core::fmt::Display for CheckpointAt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::PreExecution => write!(f, "pre-execution"),
+            Self::Transaction(index) => write!(f, "transaction {index}"),
+        }
+    }
+}
+
+/// A cumulative state root at one checkpoint position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransactionStateCheckpoint {
-    /// Zero-based position of the transaction in the block.
-    pub transaction_index: usize,
-    /// State root after this transaction and before post-execution changes.
+pub struct StateCheckpoint {
+    /// Where in the block this was sealed.
+    pub at: CheckpointAt,
+    /// State root here, before post-execution changes.
     pub state_root: B256,
     /// Hash of the candidate block for this prefix — what to hold if settlement stops here.
     pub block_hash: B256,
@@ -318,17 +335,15 @@ where
 
 /// Performs stateless validation and derives selected transaction state roots.
 ///
-/// `transaction_indices` must be strictly increasing and within the block. This
-/// API reconstructs a fresh stateless trie for every requested checkpoint, so
-/// callers should request only boundaries they actually need. Transaction roots
-/// are taken before post-execution block changes, so the last transaction root
-/// is not required to equal the block's final root.
+/// `checkpoints` must be strictly increasing and any transaction position must be
+/// in the block. A fresh stateless trie is rebuilt per checkpoint, so request only
+/// the boundaries you need. Roots precede post-execution changes.
 pub fn stateless_validation_recovered_with_state_checkpoints<ChainSpec, E, N>(
     recovered_block: RecoveredBlock<GenericBlock<<N as NodePrimitives>::SignedTx>>,
     witness: ExecutionWitness,
     chain_spec: Arc<ChainSpec>,
     evm_config: E,
-    transaction_indices: &[usize],
+    checkpoints: &[CheckpointAt],
 ) -> Result<StatelessValidationWithStateCheckpointsOutput<N::Receipt>, StatelessValidationError>
 where
     ChainSpec: Send + Sync + EthChainSpec<Header = Header> + EthereumHardforks + Debug,
@@ -340,7 +355,7 @@ where
         ChainSpec,
         E,
         N,
-    >(recovered_block, witness, chain_spec, evm_config, transaction_indices)
+    >(recovered_block, witness, chain_spec, evm_config, checkpoints)
 }
 
 /// Performs stateless validation with selected checkpoints using a custom trie.
@@ -349,7 +364,7 @@ pub fn stateless_validation_recovered_with_trie_and_state_checkpoints<T, ChainSp
     witness: ExecutionWitness,
     chain_spec: Arc<ChainSpec>,
     evm_config: E,
-    transaction_indices: &[usize],
+    checkpoints: &[CheckpointAt],
 ) -> Result<StatelessValidationWithStateCheckpointsOutput<N::Receipt>, StatelessValidationError>
 where
     T: StatelessTrie,
@@ -357,7 +372,7 @@ where
     N: NodePrimitives<BlockHeader = Header, Block = GenericBlock<<N as NodePrimitives>::SignedTx>>,
     E: ConfigureEvm<Primitives = N> + Clone + 'static,
 {
-    validate_transaction_indices(transaction_indices, current_block.body().transactions.len())?;
+    validate_checkpoints(checkpoints, current_block.body().transactions.len())?;
     let (ancestor_hashes, parent_state_root) =
         validate_block_inputs(&current_block, &witness, Arc::clone(&chain_spec))?;
     let witness_template = witness.clone();
@@ -370,7 +385,7 @@ where
         .with_bal_builder_if(has_bal)
         .build();
 
-    let (transaction_state_checkpoints, result) = {
+    let (sealed_checkpoints, result) = {
         let mut executor =
             evm_config.executor_for_block(&mut state, current_block.sealed_block()).map_err(
                 |error| StatelessValidationError::StatelessExecutionFailed(format!("{error:?}")),
@@ -382,7 +397,18 @@ where
             executor.evm_mut().db_mut().bump_bal_index();
         }
 
-        let mut checkpoints = Vec::with_capacity(transaction_indices.len());
+        let mut sealed = Vec::with_capacity(checkpoints.len());
+        // Sealed before the loop: no transaction boundary can name this position.
+        if checkpoints.first() == Some(&CheckpointAt::PreExecution) {
+            let state_root = checkpoint_state_root::<T, _>(
+                &witness_template,
+                parent_state_root,
+                executor.evm().db(),
+            )?;
+            let block_hash =
+                candidate_block_hash::<N>(current_block.sealed_header(), &[], &[], state_root)?;
+            sealed.push(StateCheckpoint { at: CheckpointAt::PreExecution, state_root, block_hash });
+        }
         for (transaction_index, transaction) in current_block.transactions_recovered().enumerate() {
             executor.execute_transaction(transaction).map_err(|error| {
                 StatelessValidationError::StatelessExecutionFailed(error.to_string())
@@ -390,7 +416,8 @@ where
             if has_bal {
                 executor.evm_mut().db_mut().bump_bal_index();
             }
-            if transaction_indices.get(checkpoints.len()) == Some(&transaction_index) {
+            if checkpoints.get(sealed.len()) == Some(&CheckpointAt::Transaction(transaction_index))
+            {
                 let state_root = checkpoint_state_root::<T, _>(
                     &witness_template,
                     parent_state_root,
@@ -402,8 +429,8 @@ where
                     &executor.receipts()[..=transaction_index],
                     state_root,
                 )?;
-                checkpoints.push(TransactionStateCheckpoint {
-                    transaction_index,
+                sealed.push(StateCheckpoint {
+                    at: CheckpointAt::Transaction(transaction_index),
                     state_root,
                     block_hash,
                 });
@@ -412,7 +439,7 @@ where
         let result = executor.apply_post_execution_changes().map_err(|error| {
             StatelessValidationError::StatelessExecutionFailed(error.to_string())
         })?;
-        (checkpoints, result)
+        (sealed, result)
     };
 
     state.merge_transitions(BundleRetention::Reverts);
@@ -430,8 +457,14 @@ where
     )?;
 
     // Same boundary before vs after post-execution changes; candidates rely on equality.
-    if let Some(last) = transaction_state_checkpoints.last()
-        && last.transaction_index + 1 == current_block.body().transactions.len()
+    if let Some(last) = sealed_checkpoints.last()
+        && match last.at {
+            CheckpointAt::Transaction(index) => {
+                index + 1 == current_block.body().transactions.len()
+            }
+            // The empty prefix is the final boundary only in an empty block.
+            CheckpointAt::PreExecution => current_block.body().transactions.is_empty(),
+        }
     {
         let block_root = current_block.sealed_header().state_root();
         if last.state_root != block_root {
@@ -444,7 +477,7 @@ where
 
     Ok(StatelessValidationWithStateCheckpointsOutput {
         validation,
-        checkpoints: BlockStateCheckpoints { transaction_state_checkpoints },
+        checkpoints: BlockStateCheckpoints { checkpoints: sealed_checkpoints },
     })
 }
 
@@ -521,17 +554,21 @@ where
 }
 
 /// Validate the sparse checkpoint selection before any witness work begins.
-fn validate_transaction_indices(
-    transaction_indices: &[usize],
+fn validate_checkpoints(
+    checkpoints: &[CheckpointAt],
     transactions: usize,
 ) -> Result<(), StatelessValidationError> {
-    if let Some(indices) = transaction_indices.windows(2).find(|indices| indices[0] >= indices[1]) {
-        return Err(StatelessValidationError::UnorderedTransactionCheckpoints {
-            previous: indices[0],
-            current: indices[1],
+    if let Some(pair) = checkpoints.windows(2).find(|pair| pair[0] >= pair[1]) {
+        return Err(StatelessValidationError::UnorderedCheckpoints {
+            previous: pair[0],
+            current: pair[1],
         });
     }
-    if let Some(&index) = transaction_indices.last().filter(|&&index| index >= transactions) {
+    // Only a transaction position can be out of range; the empty prefix always exists.
+    if let Some(&CheckpointAt::Transaction(index)) = checkpoints
+        .last()
+        .filter(|at| matches!(at, CheckpointAt::Transaction(i) if *i >= transactions))
+    {
         return Err(StatelessValidationError::TransactionCheckpointOutOfBounds {
             index,
             transactions,
@@ -741,10 +778,11 @@ mod tests {
     use reth_ethereum_primitives::Block;
     use reth_primitives_traits::RecoveredBlock;
 
+    use super::CheckpointAt;
     use super::{
         BLOCKHASH_ANCESTOR_LIMIT, StatelessValidationError, calculate_receipt_root,
         calculate_transaction_root, candidate_block_hash, logs_bloom, validate_block_inputs,
-        validate_transaction_indices,
+        validate_checkpoints,
     };
     use crate::ExecutionWitness;
     use alloy_consensus::TxReceipt;
@@ -891,25 +929,52 @@ mod tests {
     }
 
     #[test]
-    fn accepts_empty_and_strictly_ordered_checkpoint_indices() {
-        assert!(validate_transaction_indices(&[], 0).is_ok());
-        assert!(validate_transaction_indices(&[0, 2, 4], 5).is_ok());
-    }
-
-    #[test]
-    fn rejects_duplicate_or_descending_checkpoint_indices() {
-        for indices in [&[1, 1][..], &[2, 1][..]] {
-            assert!(matches!(
-                validate_transaction_indices(indices, 3),
-                Err(StatelessValidationError::UnorderedTransactionCheckpoints { .. })
-            ));
+    fn accepts_ordered_checkpoints_including_the_empty_prefix() {
+        // The empty prefix exists in every block, even one with no transactions.
+        for (positions, transactions) in [
+            (&[][..], 0),
+            (&[CheckpointAt::PreExecution][..], 0),
+            (&[CheckpointAt::PreExecution, CheckpointAt::Transaction(0)][..], 1),
+            (
+                &[
+                    CheckpointAt::Transaction(0),
+                    CheckpointAt::Transaction(2),
+                    CheckpointAt::Transaction(4),
+                ][..],
+                5,
+            ),
+        ] {
+            assert!(
+                validate_checkpoints(positions, transactions).is_ok(),
+                "{positions:?} over {transactions} transactions",
+            );
         }
     }
 
     #[test]
-    fn rejects_out_of_bounds_checkpoint_indices() {
+    fn rejects_unordered_checkpoints() {
+        // Last case: the empty prefix precedes every transaction, so it is only
+        // ever first — which the derived `Ord` is what enforces.
+        for positions in [
+            &[CheckpointAt::Transaction(1), CheckpointAt::Transaction(1)][..],
+            &[CheckpointAt::Transaction(2), CheckpointAt::Transaction(1)][..],
+            &[CheckpointAt::PreExecution, CheckpointAt::PreExecution][..],
+            &[CheckpointAt::Transaction(0), CheckpointAt::PreExecution][..],
+        ] {
+            assert!(
+                matches!(
+                    validate_checkpoints(positions, 3),
+                    Err(StatelessValidationError::UnorderedCheckpoints { .. })
+                ),
+                "{positions:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_checkpoints() {
         assert!(matches!(
-            validate_transaction_indices(&[0, 3], 3),
+            validate_checkpoints(&[CheckpointAt::Transaction(0), CheckpointAt::Transaction(3)], 3),
             Err(StatelessValidationError::TransactionCheckpointOutOfBounds {
                 index: 3,
                 transactions: 3,
