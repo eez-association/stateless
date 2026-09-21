@@ -10,7 +10,7 @@ use reth_ethereum_primitives::Block;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::RecoveredBlock;
 use stateless::{
-    ExecutionWitness, stateless_validation_recovered,
+    CheckpointAt, ExecutionWitness, stateless_validation_recovered,
     stateless_validation_recovered_with_state_checkpoints,
 };
 
@@ -26,6 +26,20 @@ struct CheckpointOracle {
     parent_state_root: B256,
     expected_checkpoint_indices: Vec<usize>,
     transaction_state_roots: Vec<B256>,
+}
+
+/// The oracle records effect boundaries as transaction indices; the API takes
+/// positions, and every recorded boundary is a transaction.
+fn checkpoint_positions(indices: &[usize]) -> Vec<CheckpointAt> {
+    indices.iter().copied().map(CheckpointAt::Transaction).collect()
+}
+
+/// Unwrap a position the fixture guarantees is a transaction.
+fn transaction_index(at: CheckpointAt) -> usize {
+    match at {
+        CheckpointAt::Transaction(index) => index,
+        CheckpointAt::PreExecution => panic!("fixture requested no pre-execution checkpoint"),
+    }
 }
 
 #[test]
@@ -61,15 +75,15 @@ fn selected_transaction_checkpoints_match_the_recorded_full_state_roots() {
         witness.clone(),
         Arc::clone(&chain_spec),
         evm_config.clone(),
-        &oracle.expected_checkpoint_indices,
+        &checkpoint_positions(&oracle.expected_checkpoint_indices),
     )
     .unwrap();
     let sparse = stateless_validation_recovered_with_state_checkpoints(
-        recovered,
-        witness,
-        chain_spec,
-        evm_config,
-        &[0, 2],
+        recovered.clone(),
+        witness.clone(),
+        Arc::clone(&chain_spec),
+        evm_config.clone(),
+        &[CheckpointAt::Transaction(0), CheckpointAt::Transaction(2)],
     )
     .unwrap();
 
@@ -89,12 +103,12 @@ fn selected_transaction_checkpoints_match_the_recorded_full_state_roots() {
         .into_iter()
         .zip(oracle.expected_checkpoint_indices)
         .collect::<Vec<_>>();
-    let observed = &detailed.checkpoints.transaction_state_checkpoints;
+    let observed = &detailed.checkpoints.checkpoints;
     assert_eq!(
-        observed.iter().map(|c| (c.state_root, c.transaction_index)).collect::<Vec<_>>(),
+        observed.iter().map(|c| (c.state_root, transaction_index(c.at))).collect::<Vec<_>>(),
         expected,
     );
-    assert_eq!(sparse.checkpoints.transaction_state_checkpoints, [observed[0], observed[2]]);
+    assert_eq!(sparse.checkpoints.checkpoints, [observed[0], observed[2]]);
 
     // The candidate at the final transaction holds every transaction, so it IS
     // the block under validation. Its hash must therefore equal the block's own
@@ -102,7 +116,11 @@ fn selected_transaction_checkpoints_match_the_recorded_full_state_roots() {
     // prefix-varying field list at once: get transactions_root, receipts_root,
     // logs_bloom or gas_used wrong and this fails.
     let last = observed.last().expect("the fixture selects the final transaction");
-    assert_eq!(last.transaction_index, 2, "fixture no longer ends on the last transaction");
+    assert_eq!(
+        last.at,
+        CheckpointAt::Transaction(2),
+        "fixture no longer ends on the last transaction"
+    );
     assert_eq!(
         last.block_hash, detailed.validation.block_hash,
         "the full-prefix candidate must be the block itself",
@@ -115,4 +133,36 @@ fn selected_transaction_checkpoints_match_the_recorded_full_state_roots() {
         "a proper prefix must not seal to the full block's hash",
     );
     assert_ne!(observed[0].block_hash, observed[1].block_hash);
+
+    // The empty prefix is a real block at the settling block's own height, not
+    // the parent — which is what lets a settlement consuming nothing name a
+    // block rather than fall back a height.
+    let with_empty_prefix = stateless_validation_recovered_with_state_checkpoints(
+        recovered,
+        witness,
+        chain_spec,
+        evm_config,
+        &[CheckpointAt::PreExecution, CheckpointAt::Transaction(0)],
+    )
+    .unwrap();
+    let sealed = &with_empty_prefix.checkpoints.checkpoints;
+    assert_eq!(sealed.len(), 2);
+    assert_eq!(sealed[0].at, CheckpointAt::PreExecution);
+    assert_eq!(sealed[1].at, CheckpointAt::Transaction(0));
+
+    // Its own block: distinct from every transaction prefix, the full one — and
+    // so the block itself — included.
+    for sealed_at_transaction in observed {
+        assert_ne!(
+            sealed[0].block_hash, sealed_at_transaction.block_hash,
+            "the empty prefix must differ from every transaction prefix",
+        );
+    }
+
+    // 2935/4788 write before transaction 0, so the empty prefix is NOT the
+    // parent's post-state.
+    assert_ne!(
+        sealed[0].state_root, oracle.parent_state_root,
+        "pre-execution system calls must be inside the empty prefix",
+    );
 }

@@ -47,11 +47,13 @@ pub use tries::StatelessTrie;
 #[doc(inline)]
 pub use validation::BlockStateCheckpoints;
 #[doc(inline)]
+pub use validation::CheckpointAt;
+#[doc(inline)]
+pub use validation::StateCheckpoint;
+#[doc(inline)]
 pub use validation::StatelessValidationOutput;
 #[doc(inline)]
 pub use validation::StatelessValidationWithStateCheckpointsOutput;
-#[doc(inline)]
-pub use validation::TransactionStateCheckpoint;
 #[doc(inline)]
 pub use validation::candidate_block_hash;
 #[doc(inline)]
