@@ -10,7 +10,7 @@ use reth_ethereum_primitives::Block;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::RecoveredBlock;
 use stateless::{
-    ExecutionWitness, TransactionStateCheckpoint, stateless_validation_recovered,
+    ExecutionWitness, stateless_validation_recovered,
     stateless_validation_recovered_with_state_checkpoints,
 };
 
@@ -88,11 +88,31 @@ fn selected_transaction_checkpoints_match_the_recorded_full_state_roots() {
         .transaction_state_roots
         .into_iter()
         .zip(oracle.expected_checkpoint_indices)
-        .map(|(state_root, transaction_index)| TransactionStateCheckpoint {
-            transaction_index,
-            state_root,
-        })
         .collect::<Vec<_>>();
-    assert_eq!(detailed.checkpoints.transaction_state_checkpoints, expected);
-    assert_eq!(sparse.checkpoints.transaction_state_checkpoints, [expected[0], expected[2]]);
+    let observed = &detailed.checkpoints.transaction_state_checkpoints;
+    assert_eq!(
+        observed.iter().map(|c| (c.state_root, c.transaction_index)).collect::<Vec<_>>(),
+        expected,
+    );
+    assert_eq!(sparse.checkpoints.transaction_state_checkpoints, [observed[0], observed[2]]);
+
+    // The candidate at the final transaction holds every transaction, so it IS
+    // the block under validation. Its hash must therefore equal the block's own
+    // — a value this code did not produce. That check covers the whole
+    // prefix-varying field list at once: get transactions_root, receipts_root,
+    // logs_bloom or gas_used wrong and this fails.
+    let last = observed.last().expect("the fixture selects the final transaction");
+    assert_eq!(last.transaction_index, 2, "fixture no longer ends on the last transaction");
+    assert_eq!(
+        last.block_hash, detailed.validation.block_hash,
+        "the full-prefix candidate must be the block itself",
+    );
+
+    // Shorter prefixes are different blocks. A candidate that reused the full
+    // block's transaction or receipt roots would collide here.
+    assert!(
+        observed[0].block_hash != last.block_hash && observed[1].block_hash != last.block_hash,
+        "a proper prefix must not seal to the full block's hash",
+    );
+    assert_ne!(observed[0].block_hash, observed[1].block_hash);
 }

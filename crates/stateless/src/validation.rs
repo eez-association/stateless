@@ -11,7 +11,11 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use alloy_consensus::{Block as GenericBlock, BlockHeader, Header};
+use alloy_consensus::{
+    Block as GenericBlock, BlockHeader, Header, TxReceipt,
+    proofs::{calculate_receipt_root, calculate_transaction_root},
+};
+use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 use alloy_eips::eip7928::{
     BlockAccessList, ITEM_COST, compute_block_access_list_hash, total_bal_items,
 };
@@ -26,7 +30,9 @@ use reth_evm::{
     block::BlockExecutor,
     execute::{BlockExecutionOutput, Executor},
 };
-use reth_primitives_traits::{NodePrimitives, RecoveredBlock, SealedHeader, SignedTransaction};
+use reth_primitives_traits::{
+    NodePrimitives, RecoveredBlock, SealedHeader, SignedTransaction, logs_bloom,
+};
 use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 use revm::database::{BundleState, State, states::bundle_state::BundleRetention};
 use tries::{StatelessTrie, StatelessTrieError, default::StatelessSparseTrie};
@@ -97,6 +103,19 @@ pub enum StatelessValidationError {
         /// The maximum number of items allowed, the block gas limit divided by the per item cost.
         limit: u64,
     },
+
+    /// A last-transaction checkpoint matches the block root only if post-execution changes touch no state.
+    #[error("post-execution changes are not state-neutral: checkpoint {checkpoint}, block {block}")]
+    PostExecutionChangesNotStateNeutral {
+        /// Root at the last transaction, before post-execution changes.
+        checkpoint: B256,
+        /// The block's validated post-state root.
+        block: B256,
+    },
+
+    /// A block carries a field a candidate cannot reproduce from a prefix.
+    #[error("candidate block cannot reproduce {0} from a transaction prefix")]
+    CandidateBlockUnsupportedField(&'static str),
 
     /// Error during stateless state root calculation.
     #[error("stateless state root calculation failed")]
@@ -215,6 +234,8 @@ pub struct TransactionStateCheckpoint {
     pub transaction_index: usize,
     /// State root after this transaction and before post-execution changes.
     pub state_root: B256,
+    /// Hash of the candidate block for this prefix — what to hold if settlement stops here.
+    pub block_hash: B256,
 }
 
 /// Successful stateless validation with opt-in execution checkpoints.
@@ -370,13 +391,21 @@ where
                 executor.evm_mut().db_mut().bump_bal_index();
             }
             if transaction_indices.get(checkpoints.len()) == Some(&transaction_index) {
+                let state_root = checkpoint_state_root::<T, _>(
+                    &witness_template,
+                    parent_state_root,
+                    executor.evm().db(),
+                )?;
+                let block_hash = candidate_block_hash::<N>(
+                    current_block.sealed_header(),
+                    &current_block.body().transactions[..=transaction_index],
+                    &executor.receipts()[..=transaction_index],
+                    state_root,
+                )?;
                 checkpoints.push(TransactionStateCheckpoint {
                     transaction_index,
-                    state_root: checkpoint_state_root::<T, _>(
-                        &witness_template,
-                        parent_state_root,
-                        executor.evm().db(),
-                    )?,
+                    state_root,
+                    block_hash,
                 });
             }
         }
@@ -399,6 +428,19 @@ where
         output,
         block_access_list,
     )?;
+
+    // Same boundary before vs after post-execution changes; candidates rely on equality.
+    if let Some(last) = transaction_state_checkpoints.last()
+        && last.transaction_index + 1 == current_block.body().transactions.len()
+    {
+        let block_root = current_block.sealed_header().state_root();
+        if last.state_root != block_root {
+            return Err(StatelessValidationError::PostExecutionChangesNotStateNeutral {
+                checkpoint: last.state_root,
+                block: block_root,
+            });
+        }
+    }
 
     Ok(StatelessValidationWithStateCheckpointsOutput {
         validation,
@@ -496,6 +538,64 @@ fn validate_transaction_indices(
         });
     }
     Ok(())
+}
+
+/// Seal the candidate block for this prefix, field by field — never by updating
+/// a clone, so a new `Header` field fails the build instead of being inherited.
+///
+/// Public so every backend that replays a window seals candidates identically.
+pub fn candidate_block_hash<N>(
+    settling: &SealedHeader,
+    transactions: &[N::SignedTx],
+    receipts: &[N::Receipt],
+    state_root: B256,
+) -> Result<B256, StatelessValidationError>
+where
+    N: NodePrimitives,
+{
+    // Neither is reproducible from a prefix, so refuse rather than inherit.
+    if settling.block_access_list_hash().is_some() {
+        return Err(StatelessValidationError::CandidateBlockUnsupportedField("block access list"));
+    }
+    if settling.requests_hash().is_some_and(|hash| hash != EMPTY_REQUESTS_HASH) {
+        return Err(StatelessValidationError::CandidateBlockUnsupportedField("execution requests"));
+    }
+    // No blob transactions on an EEZ L2, so no prefix apportioning to get right.
+    if settling.blob_gas_used().is_some_and(|used| used != 0) {
+        return Err(StatelessValidationError::CandidateBlockUnsupportedField("blob transactions"));
+    }
+
+    let header = Header {
+        // Prefix-varying.
+        state_root,
+        transactions_root: calculate_transaction_root(transactions),
+        receipts_root: calculate_receipt_root(
+            &receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>(),
+        ),
+        logs_bloom: logs_bloom(receipts.iter().flat_map(TxReceipt::logs)),
+        gas_used: receipts.last().map(TxReceipt::cumulative_gas_used).unwrap_or_default(),
+        // Zero for every prefix: a non-zero value was refused above.
+        blob_gas_used: settling.blob_gas_used(),
+        // Fixed by parent + payload attributes, so shared with the settling block.
+        parent_hash: settling.parent_hash(),
+        ommers_hash: settling.ommers_hash(),
+        beneficiary: settling.beneficiary(),
+        withdrawals_root: settling.withdrawals_root(),
+        difficulty: settling.difficulty(),
+        number: settling.number(),
+        gas_limit: settling.gas_limit(),
+        timestamp: settling.timestamp(),
+        extra_data: settling.extra_data().clone(),
+        mix_hash: settling.mix_hash().unwrap_or_default(),
+        nonce: settling.nonce().unwrap_or_default(),
+        base_fee_per_gas: settling.base_fee_per_gas(),
+        excess_blob_gas: settling.excess_blob_gas(),
+        parent_beacon_block_root: settling.parent_beacon_block_root(),
+        requests_hash: settling.requests_hash(),
+        block_access_list_hash: None,
+        slot_number: settling.slot_number(),
+    };
+    Ok(header.hash_slow())
 }
 
 /// Derive one cumulative root without mutating the live execution state.
@@ -642,10 +742,153 @@ mod tests {
     use reth_primitives_traits::RecoveredBlock;
 
     use super::{
-        BLOCKHASH_ANCESTOR_LIMIT, StatelessValidationError, validate_block_inputs,
+        BLOCKHASH_ANCESTOR_LIMIT, StatelessValidationError, calculate_receipt_root,
+        calculate_transaction_root, candidate_block_hash, logs_bloom, validate_block_inputs,
         validate_transaction_indices,
     };
     use crate::ExecutionWitness;
+    use alloy_consensus::TxReceipt;
+    use alloy_consensus::{Header, TxLegacy, TxType};
+    use alloy_primitives::{Address, B256, Bloom, Log, Signature, U256};
+    use reth_ethereum_primitives::{
+        EthPrimitives, EthereumReceipt, Transaction, TransactionSigned,
+    };
+    use reth_primitives_traits::SealedHeader;
+
+    fn tx(nonce: u64) -> TransactionSigned {
+        TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy { nonce, ..Default::default() }),
+            Signature::new(U256::from(1), U256::from(1), false),
+        )
+    }
+
+    fn receipt(cumulative_gas_used: u64) -> EthereumReceipt {
+        logging_receipt(cumulative_gas_used, Vec::new())
+    }
+
+    fn logging_receipt(cumulative_gas_used: u64, logs: Vec<Log>) -> EthereumReceipt {
+        EthereumReceipt { tx_type: TxType::Legacy, success: true, cumulative_gas_used, logs }
+    }
+
+    /// Vary one prefix-varying input at a time; an inherited field would tie.
+    #[test]
+    fn every_prefix_varying_field_changes_the_candidate() {
+        let settling = SealedHeader::seal_slow(Header::default());
+        let txs = [tx(0), tx(1)];
+        let receipts = [receipt(21_000), receipt(42_000)];
+        let root = B256::repeat_byte(0xab);
+
+        let base =
+            candidate_block_hash::<EthPrimitives>(&settling, &txs[..1], &receipts[..1], root)
+                .unwrap();
+
+        // transactions_root
+        assert_ne!(
+            base,
+            candidate_block_hash::<EthPrimitives>(&settling, &txs[..2], &receipts[..1], root)
+                .unwrap(),
+            "a longer transaction prefix must seal a different candidate",
+        );
+        // receipts_root, logs_bloom and gas_used all move together here
+        assert_ne!(
+            base,
+            candidate_block_hash::<EthPrimitives>(&settling, &txs[..1], &receipts[..2], root)
+                .unwrap(),
+            "a longer receipt prefix must seal a different candidate",
+        );
+        // state_root
+        assert_ne!(
+            base,
+            candidate_block_hash::<EthPrimitives>(
+                &settling,
+                &txs[..1],
+                &receipts[..1],
+                B256::repeat_byte(0xcd)
+            )
+            .unwrap(),
+            "a different state root must seal a different candidate",
+        );
+    }
+
+    /// Inequality between calls misses a uniformly wrong field, so pin the header.
+    #[test]
+    fn the_candidate_header_is_exactly_this() {
+        let settling = SealedHeader::seal_slow(Header {
+            // Unequal to the prefix's values, so inheriting shows up.
+            gas_used: 999_999,
+            transactions_root: B256::repeat_byte(0xf1),
+            receipts_root: B256::repeat_byte(0xf2),
+            logs_bloom: Bloom::repeat_byte(0xf3),
+            number: 7,
+            gas_limit: 30_000_000,
+            timestamp: 1_234,
+            ..Default::default()
+        });
+        let txs = [tx(0)];
+        // A real log: with none, the computed bloom equals a default header's.
+        let receipts = [logging_receipt(
+            21_000,
+            vec![Log::new_unchecked(
+                Address::repeat_byte(0x42),
+                vec![B256::repeat_byte(0x01)],
+                Default::default(),
+            )],
+        )];
+        let root = B256::repeat_byte(0xab);
+
+        let expected = Header {
+            state_root: root,
+            transactions_root: calculate_transaction_root(&txs),
+            receipts_root: calculate_receipt_root(
+                &receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>(),
+            ),
+            logs_bloom: logs_bloom(receipts.iter().flat_map(TxReceipt::logs)),
+            gas_used: 21_000,
+            number: 7,
+            gas_limit: 30_000_000,
+            timestamp: 1_234,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            candidate_block_hash::<EthPrimitives>(&settling, &txs, &receipts, root).unwrap(),
+            expected.hash_slow(),
+        );
+    }
+
+    /// Fields a prefix cannot reproduce are refused, not inherited.
+    #[test]
+    fn unreproducible_fields_are_refused() {
+        let with_bal = SealedHeader::seal_slow(Header {
+            block_access_list_hash: Some(B256::repeat_byte(0x11)),
+            ..Default::default()
+        });
+        assert!(matches!(
+            candidate_block_hash::<EthPrimitives>(&with_bal, &[], &[], B256::ZERO),
+            Err(StatelessValidationError::CandidateBlockUnsupportedField("block access list")),
+        ));
+
+        let with_requests = SealedHeader::seal_slow(Header {
+            requests_hash: Some(B256::repeat_byte(0x22)),
+            ..Default::default()
+        });
+        assert!(matches!(
+            candidate_block_hash::<EthPrimitives>(&with_requests, &[], &[], B256::ZERO),
+            Err(StatelessValidationError::CandidateBlockUnsupportedField("execution requests")),
+        ));
+
+        let with_blobs =
+            SealedHeader::seal_slow(Header { blob_gas_used: Some(131_072), ..Default::default() });
+        assert!(matches!(
+            candidate_block_hash::<EthPrimitives>(&with_blobs, &[], &[], B256::ZERO),
+            Err(StatelessValidationError::CandidateBlockUnsupportedField("blob transactions")),
+        ));
+
+        // Cancun without blob transactions is the ordinary case and must pass.
+        let cancun =
+            SealedHeader::seal_slow(Header { blob_gas_used: Some(0), ..Default::default() });
+        assert!(candidate_block_hash::<EthPrimitives>(&cancun, &[], &[], B256::ZERO).is_ok());
+    }
 
     #[test]
     fn accepts_empty_and_strictly_ordered_checkpoint_indices() {
