@@ -77,6 +77,12 @@ cheaper validation-only API. Callers processing untrusted input must also cap
 the number of requested checkpoints; selecting indices avoids unnecessary work
 but does not itself impose an application-specific resource limit.
 
+Recovered-block APIs accept the transaction and receipt types of the supplied
+`ConfigureEvm`, including native rollup transactions. Blocks must still use
+Ethereum headers and bodies and satisfy the existing consensus, witness, and
+commitment checks. Sender authentication is the caller's responsibility. The
+public-key recovery API and default output receipt type remain Ethereum-specific.
+
 ## `no_std`
 
 The `stateless` crate is `#![no_std]` compatible and builds for the 64-bit RISC-V target (`riscv64im-unknown-none-elf`), making it suitable for use in zkVM environments. Because upstream dependencies currently require atomics, it must be built using the custom target specification provided in `targets/riscv64im-unknown-none-elf.json`.
