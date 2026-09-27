@@ -46,5 +46,6 @@ serde.workspace = true
 serde_with.workspace = true
 
 [dev-dependencies]
+zeth-mpt = { path = "../zeth-mpt" }
 reth-evm-ethereum.workspace = true
 serde_json.workspace = true

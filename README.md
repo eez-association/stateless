@@ -12,6 +12,32 @@ post-state root, and optional sparse transaction-state checkpoints from the
 same execution. Checkpoint selection, quotas, and exact returned-index checks
 remain caller responsibilities.
 
+## EEZ Reth compatibility branch
+
+`feat/reth-27429` carries the EEZ checkpoint API from fork commit
+`4fc3806bdd0e6b296c761ef4d4b260938365cf45` onto upstream Reth
+`444e867155c2a7a4c028e479ca7201b0b6871579` (the merge of Reth #27429,
+after v2.6.0). All Reth consumers must use that same revision. Dependencies
+are aligned with REVM 43.0.3, Alloy 2.5.0 and Reth primitives 0.8.1.
+
+The trie adaptation incorporates upstream Stateless
+`923f1b759c916b2b5e42c26fa3a55a8d0b820bc3`: batch leaf updates and explicit
+storage resets. Destroyed storage is cleared before both checkpoint and final
+state roots are computed. The independent checkpoint fixture and blinded-storage
+regressions cover these boundaries.
+
+Run the same host checks as [branch CI](.github/workflows/eez-reth.yml):
+
+```bash
+cargo +1.95.0 fmt --all --check
+cargo +1.95.0 clippy --locked -p stateless -p tries -p zeth-mpt --all-targets -- -D warnings
+cargo +1.95.0 test --locked -p stateless -p tries -p zeth-mpt
+```
+
+Consumers must pin an exact commit, rather than the moving branch name. This
+branch validates EEZ's host use; the retained EF and RISC-V procedures below
+have not been validated against this Reth pin.
+
 [gh-ci]: https://github.com/eez-association/stateless/actions/workflows/ci.yml
 [tg-badge]: https://img.shields.io/endpoint?color=neon&logo=telegram&label=chat&url=https%3A%2F%2Ftg.sumanjay.workers.dev%2Fparadigm%5Freth
 [tg-url]: https://t.me/paradigm_reth

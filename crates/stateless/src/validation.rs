@@ -517,7 +517,24 @@ where
     T: StatelessTrie,
 {
     let (mut trie, _) = T::new(witness, parent_state_root)?;
-    let hashed_state = HashedPostState::from_bundle_state::<KeccakKeyHasher>(&bundle.state);
+    apply_bundle_state(&mut trie, bundle)
+}
+
+/// Apply the same storage-reset semantics to prefix and final block roots.
+fn apply_bundle_state<T: StatelessTrie>(
+    trie: &mut T,
+    bundle: &BundleState,
+) -> Result<B256, StatelessValidationError> {
+    let mut hashed_state = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
+    // Reth v2.6 no longer carries reset markers in HashedPostState. As in upstream
+    // Stateless, clear even blinded old slots before applying recreated storage.
+    for (address, account) in bundle.state() {
+        if account.was_destroyed() {
+            let hashed_address = keccak256(address);
+            trie.clear_storage(hashed_address);
+            hashed_state.storages.entry(hashed_address).or_default();
+        }
+    }
     trie.calculate_state_root(hashed_state).map_err(Into::into)
 }
 
@@ -551,8 +568,7 @@ where
     )
     .map_err(StatelessValidationError::ConsensusValidationFailed)?;
 
-    let hashed_state = HashedPostState::from_bundle_state::<KeccakKeyHasher>(&output.state.state);
-    let post_state_root = trie.calculate_state_root(hashed_state)?;
+    let post_state_root = apply_bundle_state(&mut trie, &output.state)?;
     if post_state_root != current_block.state_root {
         return Err(StatelessValidationError::PostStateRootMismatch {
             got: post_state_root,
@@ -635,6 +651,65 @@ mod tests {
         validate_transaction_indices,
     };
     use crate::ExecutionWitness;
+
+    #[test]
+    fn destroyed_bundle_discards_blinded_storage_for_checkpoint_and_final_roots() {
+        use alloy_primitives::{Address, B256, U256, keccak256};
+        use reth_trie_common::TrieAccount;
+        use revm::database::{AccountStatus, BundleAccount, BundleState, states::StorageSlot};
+        use tries::default::StatelessSparseTrie;
+        use zeth_mpt::Trie;
+
+        for new_value in [U256::ZERO, U256::from(7)] {
+            let address = Address::with_last_byte(1);
+            let hashed_address = keccak256(address);
+            let old_slot = U256::from(1);
+            let new_slot = U256::from(2);
+            let mut storage = Trie::default();
+            storage.insert(keccak256(B256::from(old_slot)), alloy_rlp::encode(U256::from(42)));
+            let mut account =
+                TrieAccount { storage_root: storage.hash_slow(), ..Default::default() };
+            let mut state = Trie::default();
+            state.insert(hashed_address, alloy_rlp::encode(account));
+            let parent_root = state.hash_slow();
+            // The destroyed storage is deliberately absent from the witness.
+            let witness = ExecutionWitness { state: state.rlp_nodes(), ..Default::default() };
+            let mut bundle = BundleState::default();
+            bundle.state.insert(
+                address,
+                BundleAccount::new(
+                    Some(Default::default()),
+                    Some(Default::default()),
+                    [(new_slot, StorageSlot::new_changed(U256::ZERO, new_value))]
+                        .into_iter()
+                        .collect(),
+                    AccountStatus::DestroyedChanged,
+                ),
+            );
+            storage.clear();
+            if !new_value.is_zero() {
+                storage.insert(keccak256(B256::from(new_slot)), alloy_rlp::encode(new_value));
+            }
+            account.storage_root = storage.hash_slow();
+            state.insert(hashed_address, alloy_rlp::encode(account));
+            let expected = state.hash_slow();
+            // Checkpoint calculation reveals a new trie for each requested prefix.
+            assert_eq!(
+                super::calculate_state_root::<StatelessSparseTrie>(
+                    witness.clone(),
+                    parent_root,
+                    &bundle,
+                )
+                .unwrap(),
+                expected
+            );
+            // Final validation applies the execution bundle to its existing trie.
+            let (mut trie, _) = StatelessSparseTrie::new(witness, parent_root).unwrap();
+            assert_eq!(super::apply_bundle_state(&mut trie, &bundle).unwrap(), expected);
+            assert_eq!(trie.storage(address, old_slot).unwrap(), U256::ZERO);
+            assert_eq!(trie.storage(address, new_slot).unwrap(), new_value);
+        }
+    }
 
     #[test]
     fn accepts_empty_and_strictly_ordered_checkpoint_indices() {
