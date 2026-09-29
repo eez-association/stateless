@@ -2,9 +2,9 @@ name: EEZ Reth compatibility
 
 on:
   push:
-    branches: [feat/reth-27429]
+    branches: [feat/reth-27429, feat/reth-v2.7-native-system-txs]
   pull_request:
-    branches: [feat/reth-27429]
+    branches: [feat/reth-27429, feat/reth-v2.7-native-system-txs]
   workflow_dispatch:
 
 permissions:

@@ -65,13 +65,39 @@ fn selected_transaction_checkpoints_match_the_recorded_full_state_roots() {
     )
     .unwrap();
     let sparse = stateless_validation_recovered_with_state_checkpoints(
+        recovered.clone(),
+        witness.clone(),
+        Arc::clone(&chain_spec),
+        evm_config.clone(),
+        &[0, 2],
+    )
+    .unwrap();
+
+    // System calls run before transaction zero. Selecting no transaction
+    // boundaries must still expose that state, without changing validation.
+    let empty_selection = stateless_validation_recovered_with_state_checkpoints(
         recovered,
         witness,
         chain_spec,
         evm_config,
-        &[0, 2],
+        &[],
     )
     .unwrap();
+    assert_eq!(empty_selection.validation, ordinary);
+    assert!(empty_selection.checkpoints.transaction_state_checkpoints.is_empty());
+    assert_eq!(
+        empty_selection.checkpoints.pre_transaction_state_root,
+        detailed.checkpoints.pre_transaction_state_root
+    );
+    assert_eq!(
+        sparse.checkpoints.pre_transaction_state_root,
+        detailed.checkpoints.pre_transaction_state_root
+    );
+    assert_ne!(detailed.checkpoints.pre_transaction_state_root, oracle.parent_state_root);
+    assert_ne!(
+        detailed.checkpoints.pre_transaction_state_root,
+        detailed.checkpoints.transaction_state_checkpoints[0].state_root
+    );
 
     assert_eq!(detailed.validation, ordinary);
     assert_eq!(detailed.validation.block_hash, oracle.block_hash);

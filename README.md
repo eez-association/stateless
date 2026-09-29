@@ -14,10 +14,11 @@ remain caller responsibilities.
 
 ## EEZ Reth compatibility branch
 
-`feat/reth-27429` carries the EEZ checkpoint API from fork commit
-`4fc3806bdd0e6b296c761ef4d4b260938365cf45` onto upstream Reth
-`444e867155c2a7a4c028e479ca7201b0b6871579` (the merge of Reth #27429,
-after v2.6.0). All Reth consumers must use that same revision. Dependencies
+`feat/reth-v2.7-native-system-txs` builds on `feat/reth-27429` and the
+existing generic recovered-block validation change. It targets upstream Reth
+v2.7.0 (`3d592ece6de8c4559987416a544fc215fd6d6921`). All Reth consumers
+must use that same revision. The manifest uses the release tag to match Gnosis
+Cargo source identities; `Cargo.lock` pins the exact commit above. Dependencies
 are aligned with REVM 43.0.3, Alloy 2.5.0 and Reth primitives 0.8.1.
 
 The trie adaptation incorporates upstream Stateless
@@ -99,7 +100,9 @@ after that transaction, before post-block changes. Consequently, the last
 requested transaction root need not equal the validated block's final root.
 Indices must be strictly increasing and in bounds. The checkpoint API rebuilds
 a trie only for each requested boundary and is intentionally separate from the
-cheaper validation-only API. Callers processing untrusted input must also cap
+cheaper validation-only API. The checkpoint output also exposes the state root
+after pre-execution system changes and before transaction zero; this is distinct
+from the parent state root and allows consumers to reconstruct an empty prefix. Callers processing untrusted input must also cap
 the number of requested checkpoints; selecting indices avoids unnecessary work
 but does not itself impose an application-specific resource limit.
 

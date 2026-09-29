@@ -11,7 +11,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use alloy_consensus::{Block as GenericBlock, BlockHeader, Header};
+use alloy_consensus::{BlockHeader, Header};
 use alloy_eips::eip7928::{
     BlockAccessList, ITEM_COST, compute_block_access_list_hash, total_bal_items,
 };
@@ -26,7 +26,9 @@ use reth_evm::{
     block::BlockExecutor,
     execute::{BlockExecutionOutput, Executor},
 };
-use reth_primitives_traits::{NodePrimitives, RecoveredBlock, SealedHeader, SignedTransaction};
+use reth_primitives_traits::{
+    Block as BlockTrait, BlockBody, NodePrimitives, Receipt, RecoveredBlock, SealedHeader,
+};
 use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 use revm::database::{BundleState, State, states::bundle_state::BundleRetention};
 use tries::{StatelessTrie, StatelessTrieError, default::StatelessSparseTrie};
@@ -204,6 +206,9 @@ pub struct StatelessValidationOutput<R = EthereumReceipt> {
 /// Selected transaction state checkpoints from one validated block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockStateCheckpoints {
+    /// State after pre-execution system changes and before the first transaction.
+    /// This is distinct from the parent root, including for empty blocks.
+    pub pre_transaction_state_root: B256,
     /// Requested cumulative transaction checkpoints, in transaction order.
     pub transaction_state_checkpoints: Vec<TransactionStateCheckpoint>,
 }
@@ -262,7 +267,7 @@ where
 {
     let recovered_block = recover_block_with_public_keys(current_block, public_keys, &*chain_spec)?;
 
-    stateless_validation_recovered_with_trie::<T, ChainSpec, E, EthPrimitives>(
+    stateless_validation_recovered_with_trie::<T, ChainSpec, E>(
         recovered_block,
         witness,
         chain_spec,
@@ -272,22 +277,23 @@ where
 
 /// Performs stateless validation of an already-recovered block.
 ///
-/// Uses the caller's transaction and receipt types so native rollup transactions
-/// retain their execution rules and receipt encoding during witness replay.
-/// Callers must authenticate the recovered senders; Ethereum header, body, and
-/// post-execution commitment checks still apply.
-pub fn stateless_validation_recovered<ChainSpec, E, N>(
-    recovered_block: RecoveredBlock<GenericBlock<<N as NodePrimitives>::SignedTx>>,
+/// Callers must authenticate the recovered senders. The supplied EVM determines
+/// transaction and receipt types; Ethereum header consensus, witness validity
+/// and post-execution commitments are still checked.
+pub fn stateless_validation_recovered<ChainSpec, E>(
+    recovered_block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
     witness: ExecutionWitness,
     chain_spec: Arc<ChainSpec>,
     evm_config: E,
-) -> Result<StatelessValidationOutput<N::Receipt>, StatelessValidationError>
+) -> Result<
+    StatelessValidationOutput<<E::Primitives as NodePrimitives>::Receipt>,
+    StatelessValidationError,
+>
 where
     ChainSpec: Send + Sync + EthChainSpec<Header = Header> + EthereumHardforks + Debug,
-    N: NodePrimitives<BlockHeader = Header, Block = GenericBlock<<N as NodePrimitives>::SignedTx>>,
-    E: ConfigureEvm<Primitives = N> + Clone + 'static,
+    E: ConfigureEvm<Primitives: NodePrimitives<BlockHeader = Header>> + Clone + 'static,
 {
-    stateless_validation_recovered_with_trie::<StatelessSparseTrie, ChainSpec, E, N>(
+    stateless_validation_recovered_with_trie::<StatelessSparseTrie, ChainSpec, E>(
         recovered_block,
         witness,
         chain_spec,
@@ -302,41 +308,44 @@ where
 /// callers should request only boundaries they actually need. Transaction roots
 /// are taken before post-execution block changes, so the last transaction root
 /// is not required to equal the block's final root.
-pub fn stateless_validation_recovered_with_state_checkpoints<ChainSpec, E, N>(
-    recovered_block: RecoveredBlock<GenericBlock<<N as NodePrimitives>::SignedTx>>,
+pub fn stateless_validation_recovered_with_state_checkpoints<ChainSpec, E>(
+    recovered_block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
     witness: ExecutionWitness,
     chain_spec: Arc<ChainSpec>,
     evm_config: E,
     transaction_indices: &[usize],
-) -> Result<StatelessValidationWithStateCheckpointsOutput<N::Receipt>, StatelessValidationError>
+) -> Result<
+    StatelessValidationWithStateCheckpointsOutput<<E::Primitives as NodePrimitives>::Receipt>,
+    StatelessValidationError,
+>
 where
     ChainSpec: Send + Sync + EthChainSpec<Header = Header> + EthereumHardforks + Debug,
-    N: NodePrimitives<BlockHeader = Header, Block = GenericBlock<<N as NodePrimitives>::SignedTx>>,
-    E: ConfigureEvm<Primitives = N> + Clone + 'static,
+    E: ConfigureEvm<Primitives: NodePrimitives<BlockHeader = Header>> + Clone + 'static,
 {
     stateless_validation_recovered_with_trie_and_state_checkpoints::<
         StatelessSparseTrie,
         ChainSpec,
         E,
-        N,
     >(recovered_block, witness, chain_spec, evm_config, transaction_indices)
 }
 
 /// Performs stateless validation with selected checkpoints using a custom trie.
-pub fn stateless_validation_recovered_with_trie_and_state_checkpoints<T, ChainSpec, E, N>(
-    current_block: RecoveredBlock<GenericBlock<<N as NodePrimitives>::SignedTx>>,
+pub fn stateless_validation_recovered_with_trie_and_state_checkpoints<T, ChainSpec, E>(
+    current_block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
     witness: ExecutionWitness,
     chain_spec: Arc<ChainSpec>,
     evm_config: E,
     transaction_indices: &[usize],
-) -> Result<StatelessValidationWithStateCheckpointsOutput<N::Receipt>, StatelessValidationError>
+) -> Result<
+    StatelessValidationWithStateCheckpointsOutput<<E::Primitives as NodePrimitives>::Receipt>,
+    StatelessValidationError,
+>
 where
     T: StatelessTrie,
     ChainSpec: Send + Sync + EthChainSpec<Header = Header> + EthereumHardforks + Debug,
-    N: NodePrimitives<BlockHeader = Header, Block = GenericBlock<<N as NodePrimitives>::SignedTx>>,
-    E: ConfigureEvm<Primitives = N> + Clone + 'static,
+    E: ConfigureEvm<Primitives: NodePrimitives<BlockHeader = Header>> + Clone + 'static,
 {
-    validate_transaction_indices(transaction_indices, current_block.body().transactions.len())?;
+    validate_transaction_indices(transaction_indices, current_block.body().transactions().len())?;
     let (ancestor_hashes, parent_state_root) =
         validate_block_inputs(&current_block, &witness, Arc::clone(&chain_spec))?;
     let witness_template = witness.clone();
@@ -349,7 +358,7 @@ where
         .with_bal_builder_if(has_bal)
         .build();
 
-    let (transaction_state_checkpoints, result) = {
+    let (pre_transaction_state_root, transaction_state_checkpoints, result) = {
         let mut executor =
             evm_config.executor_for_block(&mut state, current_block.sealed_block()).map_err(
                 |error| StatelessValidationError::StatelessExecutionFailed(format!("{error:?}")),
@@ -357,6 +366,11 @@ where
         executor.apply_pre_execution_changes().map_err(|error| {
             StatelessValidationError::StatelessExecutionFailed(error.to_string())
         })?;
+        let pre_transaction_state_root = checkpoint_state_root::<T, _>(
+            &witness_template,
+            parent_state_root,
+            executor.evm().db(),
+        )?;
         if has_bal {
             executor.evm_mut().db_mut().bump_bal_index();
         }
@@ -383,7 +397,7 @@ where
         let result = executor.apply_post_execution_changes().map_err(|error| {
             StatelessValidationError::StatelessExecutionFailed(error.to_string())
         })?;
-        (checkpoints, result)
+        (pre_transaction_state_root, checkpoints, result)
     };
 
     state.merge_transitions(BundleRetention::Reverts);
@@ -391,7 +405,7 @@ where
     let output_state = state.take_bundle();
     drop(state);
     let output = BlockExecutionOutput { state: output_state, result };
-    let validation = validate_execution_output::<T, ChainSpec, N>(
+    let validation = validate_execution_output(
         &current_block,
         parent_state_root,
         &chain_spec,
@@ -402,22 +416,27 @@ where
 
     Ok(StatelessValidationWithStateCheckpointsOutput {
         validation,
-        checkpoints: BlockStateCheckpoints { transaction_state_checkpoints },
+        checkpoints: BlockStateCheckpoints {
+            pre_transaction_state_root,
+            transaction_state_checkpoints,
+        },
     })
 }
 
 /// Performs stateless validation of an already-recovered block using a custom `StatelessTrie` implementation.
-pub fn stateless_validation_recovered_with_trie<T, ChainSpec, E, N>(
-    current_block: RecoveredBlock<GenericBlock<<N as NodePrimitives>::SignedTx>>,
+pub fn stateless_validation_recovered_with_trie<T, ChainSpec, E>(
+    current_block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
     witness: ExecutionWitness,
     chain_spec: Arc<ChainSpec>,
     evm_config: E,
-) -> Result<StatelessValidationOutput<N::Receipt>, StatelessValidationError>
+) -> Result<
+    StatelessValidationOutput<<E::Primitives as NodePrimitives>::Receipt>,
+    StatelessValidationError,
+>
 where
     T: StatelessTrie,
     ChainSpec: Send + Sync + EthChainSpec<Header = Header> + EthereumHardforks + Debug,
-    N: NodePrimitives<BlockHeader = Header, Block = GenericBlock<<N as NodePrimitives>::SignedTx>>,
-    E: ConfigureEvm<Primitives = N> + Clone + 'static,
+    E: ConfigureEvm<Primitives: NodePrimitives<BlockHeader = Header>> + Clone + 'static,
 {
     let (ancestor_hashes, parent_state_root) =
         validate_block_inputs(&current_block, &witness, Arc::clone(&chain_spec))?;
@@ -436,7 +455,7 @@ where
     let output = BlockExecutionOutput { state: state.take_bundle(), result };
     drop(state);
 
-    validate_execution_output::<T, ChainSpec, N>(
+    validate_execution_output(
         &current_block,
         parent_state_root,
         &chain_spec,
@@ -446,8 +465,8 @@ where
     )
 }
 
-fn validate_block_inputs<ChainSpec, Tx: SignedTransaction>(
-    current_block: &RecoveredBlock<GenericBlock<Tx>>,
+fn validate_block_inputs<ChainSpec, B: BlockTrait<Header = Header>>(
+    current_block: &RecoveredBlock<B>,
     witness: &ExecutionWitness,
     chain_spec: Arc<ChainSpec>,
 ) -> Result<(BTreeMap<u64, B256>, B256), StatelessValidationError>
@@ -549,17 +568,16 @@ fn apply_bundle_state<T: StatelessTrie>(
 }
 
 /// Apply the same post-execution consensus and commitment checks as the ordinary path.
-fn validate_execution_output<T, ChainSpec, N>(
-    current_block: &RecoveredBlock<GenericBlock<<N as NodePrimitives>::SignedTx>>,
+fn validate_execution_output<T, ChainSpec, B: BlockTrait<Header = Header>, R: Receipt>(
+    current_block: &RecoveredBlock<B>,
     pre_state_root: B256,
     chain_spec: &Arc<ChainSpec>,
     mut trie: T,
-    output: BlockExecutionOutput<N::Receipt>,
+    output: BlockExecutionOutput<R>,
     block_access_list: Option<BlockAccessList>,
-) -> Result<StatelessValidationOutput<N::Receipt>, StatelessValidationError>
+) -> Result<StatelessValidationOutput<R>, StatelessValidationError>
 where
     T: StatelessTrie,
-    N: NodePrimitives<BlockHeader = Header, Block = GenericBlock<<N as NodePrimitives>::SignedTx>>,
     ChainSpec: Send + Sync + EthChainSpec<Header = Header> + EthereumHardforks + Debug,
 {
     if let Some(bal) = block_access_list.as_ref() {
@@ -596,9 +614,9 @@ where
     })
 }
 
-fn validate_block_consensus<ChainSpec, Tx: SignedTransaction>(
+fn validate_block_consensus<ChainSpec, B: BlockTrait<Header = Header>>(
     chain_spec: Arc<ChainSpec>,
-    block: &RecoveredBlock<GenericBlock<Tx>>,
+    block: &RecoveredBlock<B>,
     parent: &SealedHeader<Header>,
 ) -> Result<(), StatelessValidationError>
 where
@@ -614,8 +632,8 @@ where
     Ok(())
 }
 
-fn compute_ancestor_hashes<Tx: SignedTransaction>(
-    current_block: &RecoveredBlock<GenericBlock<Tx>>,
+fn compute_ancestor_hashes<B: BlockTrait<Header = Header>>(
+    current_block: &RecoveredBlock<B>,
     ancestor_headers: &[SealedHeader],
 ) -> Result<BTreeMap<u64, B256>, StatelessValidationError> {
     let mut ancestor_hashes = BTreeMap::new();
