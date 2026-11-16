@@ -2,9 +2,9 @@ name: EEZ Reth compatibility
 
 on:
   push:
-    branches: [feat/reth-27429, feat/reth-v2.7-native-system-txs]
+    branches: [feat/reth-27429, feat/reth-v2.7-native-system-txs, feat/reth-v2.11-checkpoints]
   pull_request:
-    branches: [feat/reth-27429, feat/reth-v2.7-native-system-txs]
+    branches: [feat/reth-27429, feat/reth-v2.7-native-system-txs, feat/reth-v2.11-checkpoints]
   workflow_dispatch:
 
 permissions:
@@ -27,10 +27,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake
-          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
       - name: Formatting
-        run: cargo +1.95.0 fmt --all --check
+        run: cargo +1.96.0 fmt --all --check
       - name: Clippy
-        run: cargo +1.95.0 clippy --locked -p stateless -p tries -p zeth-mpt --all-targets -- -D warnings
+        run: cargo +1.96.0 clippy --locked -p stateless -p tries -p zeth-mpt --all-targets -- -D warnings
       - name: Validator, checkpoint oracle and trie regressions
-        run: cargo +1.95.0 test --locked -p stateless -p tries -p zeth-mpt
+        run: cargo +1.96.0 test --locked -p stateless -p tries -p zeth-mpt
+      - name: Compile the EF witness producer
+        run: cargo +1.96.0 check --locked -p ef-tests --all-targets --all-features

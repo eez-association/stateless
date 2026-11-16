@@ -5,6 +5,7 @@ use crate::{
     models::{BlockchainTest, ForkSpec},
 };
 use alloy_rlp::{Decodable, Encodable};
+use evm2::evm::{CacheDB, Db};
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use reth_chainspec::ChainSpec;
 use reth_consensus::{Consensus, HeaderValidator};
@@ -12,16 +13,17 @@ use reth_db_common::init::{insert_genesis_hashes, insert_genesis_history, insert
 use reth_ethereum_consensus::{EthBeaconConsensus, validate_block_post_execution};
 use reth_ethereum_primitives::{Block, TransactionSigned};
 use reth_evm::{ConfigureEvm, execute::Executor};
+use reth_evm::{database::StateProviderDatabase, witness::ExecutionWitnessRecord};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{
     Block as BlockTrait, ParallelBridgeBuffered, RecoveredBlock, SealedBlock,
 };
 use reth_provider::{
-    BlockWriter, DatabaseProviderFactory, ExecutionOutcome, HistoryWriter, OriginalValuesKnown,
-    StateWriteConfig, StateWriter, StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
+    BlockWriter, DatabaseProviderFactory, EvmStateProviderAdapter, ExecutionOutcome, HistoryWriter,
+    OriginalValuesKnown, StateWriteConfig, StateWriter, StaticFileProviderFactory,
+    StaticFileSegment, StaticFileWriter,
     test_utils::create_test_provider_factory_with_chain_spec_and_db_args,
 };
-use reth_revm::{State, database::StateProviderDatabase, witness::ExecutionWitnessRecord};
 use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
 use reth_trie_common::ExecutionWitnessMode;
 use reth_trie_db::{
@@ -313,18 +315,17 @@ where
             Error::block_failed(block_number, program_inputs.clone(), err)
         })?;
 
-        let mut witness_record = ExecutionWitnessRecord::default();
-
-        // Execute the block
+        // Retain the parent-state reads independently of the execution bundle.
         let state_provider = provider.latest();
-        let state_db = StateProviderDatabase(&state_provider);
-        let executor = executor_provider.batch_executor(state_db);
-
-        let output = executor
-            .execute_with_state_closure_always(&(*block).clone(), |statedb: &State<_>| {
-                witness_record.record_executed_state(statedb, ExecutionWitnessMode::default());
-            })
+        let mut state_db = CacheDB::new(Db::new(StateProviderDatabase::new(
+            EvmStateProviderAdapter(&state_provider),
+        )));
+        let output = executor_provider
+            .batch_executor(&mut state_db)
+            .execute(&(*block).clone())
             .map_err(|err| Error::block_failed(block_number, program_inputs.clone(), err))?;
+        let codes = ExecutionWitnessRecord::commit_execution(&mut state_db, &output.state);
+        let witness_record = ExecutionWitnessRecord::new(&state_db).with_canonical_codes(codes);
 
         // Consensus checks after block execution
         validate_block_post_execution(block, &chain_spec, &output.result, None, None)

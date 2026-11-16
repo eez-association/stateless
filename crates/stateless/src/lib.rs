@@ -6,7 +6,7 @@
 //!
 //! # Key Components
 //!
-//! * `WitnessDatabase`: An implementation of [`revm_database_interface::Database`] that uses a
+//! * `WitnessDatabase`: An implementation of [`evm2::evm::Database`] that uses a
 //!   [`tries::StatelessTrie`] implementation populated from witness data, along with provided
 //!   bytecode and ancestor block hashes, to serve state reads during execution.
 //! * `stateless_validation`: The core function that orchestrates the stateless validation process.
@@ -45,8 +45,6 @@ pub use recover_block::recover_block_with_public_keys;
 #[doc(inline)]
 pub use tries::StatelessTrie;
 #[doc(inline)]
-pub use validation::BlockStateCheckpoints;
-#[doc(inline)]
 pub use validation::StatelessValidationOutput;
 #[doc(inline)]
 pub use validation::StatelessValidationWithStateCheckpointsOutput;
@@ -64,6 +62,8 @@ pub use validation::stateless_validation_recovered_with_trie;
 pub use validation::stateless_validation_recovered_with_trie_and_state_checkpoints;
 #[doc(inline)]
 pub use validation::stateless_validation_with_trie;
+#[doc(inline)]
+pub use validation::{BlockStateCheckpoints, CheckpointExecutor};
 
 /// Implementation of stateless validation
 pub mod validation;

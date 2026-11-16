@@ -122,3 +122,42 @@ fn selected_transaction_checkpoints_match_the_recorded_full_state_roots() {
     assert_eq!(detailed.checkpoints.transaction_state_checkpoints, expected);
     assert_eq!(sparse.checkpoints.transaction_state_checkpoints, [expected[0], expected[2]]);
 }
+
+#[test]
+fn checkpoint_selection_cannot_hide_an_invalid_terminal_root() {
+    use stateless::validation::StatelessValidationError;
+
+    let mut block =
+        alloy_rlp::decode_exact::<Block>(&hex::decode(BLOCK_RLP.trim()).unwrap()).unwrap();
+    let correct_root = block.header.state_root;
+    block.header.state_root = B256::ZERO;
+    let recovered = RecoveredBlock::try_recover(block).unwrap();
+    let witness: ExecutionWitness = serde_json::from_str(WITNESS).unwrap();
+    let config = serde_json::from_str(CHAIN_CONFIG).unwrap();
+    let chain_spec = Arc::new(ChainSpec::from_genesis(Genesis { config, ..Default::default() }));
+    let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
+
+    let ordinary_error = stateless_validation_recovered(
+        recovered.clone(),
+        witness.clone(),
+        Arc::clone(&chain_spec),
+        evm_config.clone(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(ordinary_error, StatelessValidationError::PostStateRootMismatch { got, expected }
+        if got == correct_root && expected == B256::ZERO)
+    );
+    for indices in [&[][..], &[0, 2][..]] {
+        let error = stateless_validation_recovered_with_state_checkpoints(
+            recovered.clone(),
+            witness.clone(),
+            Arc::clone(&chain_spec),
+            evm_config.clone(),
+            indices,
+        )
+        .unwrap_err();
+        assert!(matches!(error, StatelessValidationError::PostStateRootMismatch { got, expected }
+            if got == correct_root && expected == B256::ZERO));
+    }
+}

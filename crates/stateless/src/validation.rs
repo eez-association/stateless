@@ -16,22 +16,42 @@ use alloy_eips::eip7928::{
     BlockAccessList, ITEM_COST, compute_block_access_list_hash, total_bal_items,
 };
 use alloy_primitives::{B256, keccak256};
+use evm2::block::{BlockState, BundleState};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_consensus::ConsensusError;
 use reth_consensus::{Consensus, HeaderValidator};
 use reth_ethereum_consensus::{EthBeaconConsensus, validate_block_post_execution};
 use reth_ethereum_primitives::{Block, EthPrimitives, EthereumReceipt};
 use reth_evm::{
-    ConfigureEvm, Evm,
-    block::BlockExecutor,
+    BlockExecutor, ConfigureEvm,
     execute::{BlockExecutionOutput, Executor},
 };
 use reth_primitives_traits::{
     Block as BlockTrait, BlockBody, NodePrimitives, Receipt, RecoveredBlock, SealedHeader,
 };
 use reth_trie_common::{HashedPostState, KeccakKeyHasher};
-use revm::database::{BundleState, State, states::bundle_state::BundleRetention};
 use tries::{StatelessTrie, StatelessTrieError, default::StatelessSparseTrie};
+
+/// A block executor exposing cumulative committed state at transaction boundaries.
+///
+/// Implementations must include pre-execution changes and every committed transaction,
+/// without applying block-finalization changes. Taking a snapshot must not mutate
+/// execution, receipt accounting, or rollback history. This must be the same
+/// accumulator consumed by finalization, including committed non-transaction cleanup.
+pub trait CheckpointExecutor: BlockExecutor {
+    /// Cumulative state before block finalization.
+    fn checkpoint_state(&self) -> &BlockState;
+}
+
+impl<T, R> CheckpointExecutor for reth_evm_ethereum::EthBlockExecutor<'_, T, R>
+where
+    T: evm2::EvmTypes<Tx: alloy_consensus::Typed2718, TxResultExt: Send + Sync>,
+    R: reth_evm::ReceiptBuilder,
+{
+    fn checkpoint_state(&self) -> &BlockState {
+        self.block_state()
+    }
+}
 
 /// BLOCKHASH ancestor lookup window limit per EVM (number of most recent blocks accessible).
 const BLOCKHASH_ANCESTOR_LIMIT: usize = 256;
@@ -321,6 +341,7 @@ pub fn stateless_validation_recovered_with_state_checkpoints<ChainSpec, E>(
 where
     ChainSpec: Send + Sync + EthChainSpec<Header = Header> + EthereumHardforks + Debug,
     E: ConfigureEvm<Primitives: NodePrimitives<BlockHeader = Header>> + Clone + 'static,
+    for<'a> reth_evm::BlockExecutorFor<'a, E>: CheckpointExecutor,
 {
     stateless_validation_recovered_with_trie_and_state_checkpoints::<
         StatelessSparseTrie,
@@ -344,6 +365,7 @@ where
     T: StatelessTrie,
     ChainSpec: Send + Sync + EthChainSpec<Header = Header> + EthereumHardforks + Debug,
     E: ConfigureEvm<Primitives: NodePrimitives<BlockHeader = Header>> + Clone + 'static,
+    for<'a> reth_evm::BlockExecutorFor<'a, E>: CheckpointExecutor,
 {
     validate_transaction_indices(transaction_indices, current_block.body().transactions().len())?;
     let (ancestor_hashes, parent_state_root) =
@@ -352,59 +374,41 @@ where
     let (trie, bytecode) = T::new(witness, parent_state_root)?;
     let db = WitnessDatabase::new(&trie, bytecode, ancestor_hashes);
     let has_bal = current_block.sealed_header().block_access_list_hash().is_some();
-    let mut state = State::builder()
-        .with_database(db)
-        .with_bundle_update()
-        .with_bal_builder_if(has_bal)
-        .build();
-
-    let (pre_transaction_state_root, transaction_state_checkpoints, result) = {
-        let mut executor =
-            evm_config.executor_for_block(&mut state, current_block.sealed_block()).map_err(
-                |error| StatelessValidationError::StatelessExecutionFailed(format!("{error:?}")),
-            )?;
-        executor.apply_pre_execution_changes().map_err(|error| {
+    let mut executor =
+        evm_config.executor_for_block(db, current_block.sealed_block()).map_err(|error| {
+            StatelessValidationError::StatelessExecutionFailed(format!("{error:?}"))
+        })?;
+    if has_bal {
+        executor.enable_block_access_list_builder();
+    }
+    executor
+        .apply_pre_execution_changes()
+        .map_err(|error| StatelessValidationError::StatelessExecutionFailed(error.to_string()))?;
+    let pre_transaction_state_root = checkpoint_state_root::<T>(
+        &witness_template,
+        parent_state_root,
+        executor.checkpoint_state(),
+    )?;
+    let mut transaction_state_checkpoints = Vec::with_capacity(transaction_indices.len());
+    for (transaction_index, transaction) in current_block.transactions_recovered().enumerate() {
+        executor.execute_transaction(transaction).map_err(|error| {
             StatelessValidationError::StatelessExecutionFailed(error.to_string())
         })?;
-        let pre_transaction_state_root = checkpoint_state_root::<T, _>(
-            &witness_template,
-            parent_state_root,
-            executor.evm().db(),
-        )?;
-        if has_bal {
-            executor.evm_mut().db_mut().bump_bal_index();
+        if transaction_indices.get(transaction_state_checkpoints.len()) == Some(&transaction_index)
+        {
+            transaction_state_checkpoints.push(TransactionStateCheckpoint {
+                transaction_index,
+                state_root: checkpoint_state_root::<T>(
+                    &witness_template,
+                    parent_state_root,
+                    executor.checkpoint_state(),
+                )?,
+            });
         }
-
-        let mut checkpoints = Vec::with_capacity(transaction_indices.len());
-        for (transaction_index, transaction) in current_block.transactions_recovered().enumerate() {
-            executor.execute_transaction(transaction).map_err(|error| {
-                StatelessValidationError::StatelessExecutionFailed(error.to_string())
-            })?;
-            if has_bal {
-                executor.evm_mut().db_mut().bump_bal_index();
-            }
-            if transaction_indices.get(checkpoints.len()) == Some(&transaction_index) {
-                checkpoints.push(TransactionStateCheckpoint {
-                    transaction_index,
-                    state_root: checkpoint_state_root::<T, _>(
-                        &witness_template,
-                        parent_state_root,
-                        executor.evm().db(),
-                    )?,
-                });
-            }
-        }
-        let result = executor.apply_post_execution_changes().map_err(|error| {
-            StatelessValidationError::StatelessExecutionFailed(error.to_string())
-        })?;
-        (pre_transaction_state_root, checkpoints, result)
-    };
-
-    state.merge_transitions(BundleRetention::Reverts);
-    let block_access_list = state.take_built_alloy_bal();
-    let output_state = state.take_bundle();
-    drop(state);
-    let output = BlockExecutionOutput { state: output_state, result };
+    }
+    let (output, block_access_list) = executor
+        .finish_with_block_access_list()
+        .map_err(|error| StatelessValidationError::StatelessExecutionFailed(error.to_string()))?;
     let validation = validate_execution_output(
         &current_block,
         parent_state_root,
@@ -451,9 +455,7 @@ where
 
     let block_access_list = executor.take_bal();
 
-    let mut state = executor.into_state();
-    let output = BlockExecutionOutput { state: state.take_bundle(), result };
-    drop(state);
+    let output = BlockExecutionOutput { state: executor.into_state(), result };
 
     validate_execution_output(
         &current_block,
@@ -518,21 +520,16 @@ fn validate_transaction_indices(
 }
 
 /// Derive one cumulative root without mutating the live execution state.
-fn checkpoint_state_root<T, DB>(
+fn checkpoint_state_root<T: StatelessTrie>(
     witness: &ExecutionWitness,
     parent_state_root: B256,
-    state: &State<DB>,
-) -> Result<B256, StatelessValidationError>
-where
-    T: StatelessTrie,
-{
-    // Snapshot pending transitions instead of merging them into the live
-    // executor state. Checkpoint derivation must not alter execution or its
-    // revert history.
-    let mut bundle = state.bundle_state.clone();
-    if let Some(transitions) = state.transition_state.clone() {
-        bundle.apply_transitions_and_create_reverts(transitions, BundleRetention::PlainState);
-    }
+    state: &BlockState,
+) -> Result<B256, StatelessValidationError> {
+    // Conversion consumes only the copy; the live executor retains its unfinalized
+    // state and rollback history for the next transaction.
+    let bundle = state
+        .clone()
+        .into_bundle_with_retention(evm2::block::bundle_state::BundleRetention::PlainState);
     calculate_state_root::<T>(witness.clone(), parent_state_root, &bundle)
 }
 
@@ -684,8 +681,8 @@ mod tests {
     #[test]
     fn destroyed_bundle_discards_blinded_storage_for_checkpoint_and_final_roots() {
         use alloy_primitives::{Address, B256, U256, keccak256};
+        use evm2::block::bundle_state::{AccountStatus, BundleAccount, BundleState, StorageSlot};
         use reth_trie_common::TrieAccount;
-        use revm::database::{AccountStatus, BundleAccount, BundleState, states::StorageSlot};
         use tries::default::StatelessSparseTrie;
         use zeth_mpt::Trie;
 
@@ -798,3 +795,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod checkpoint_tests;
